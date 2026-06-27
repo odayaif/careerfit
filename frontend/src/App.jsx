@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, Component } from 'react'
 import Layout from './components/Layout.jsx'
 import Chat from './components/Chat.jsx'
 import UserProfile from './components/UserProfile.jsx'
@@ -22,7 +22,7 @@ const EMPTY_PROFILE = {
 
 // Center panel tabs
 const CENTER_TABS = [
-  { id: 'chat', label: '💬 צ\'אט' },
+  { id: 'chat', label: "💬 צ'אט" },
   { id: 'jobs', label: '📋 משרות' },
   { id: 'dashboard', label: '📊 דשבורד' },
 ]
@@ -33,13 +33,49 @@ const RIGHT_TABS = [
   { id: 'clusters', label: '🔵 אשכולות' },
 ]
 
+// ── Top-level error boundary: prevents blank white screen on any render crash ─
+class ErrorBoundary extends Component {
+  constructor(props) {
+    super(props)
+    this.state = { hasError: false, error: null }
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error }
+  }
+  componentDidCatch(error, info) {
+    console.error('[CareerFit] Render error:', error, info)
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{
+          display: 'flex', flexDirection: 'column', alignItems: 'center',
+          justifyContent: 'center', height: '100vh', gap: 16,
+          fontFamily: 'sans-serif', direction: 'rtl', color: '#444'
+        }}>
+          <div style={{ fontSize: 48 }}>💼</div>
+          <h2>CareerFit</h2>
+          <p>נתקלתי בבעיה קטנה. רענן/י את הדף כדי להמשיך.</p>
+          <button
+            onClick={() => this.setState({ hasError: false, error: null })}
+            style={{ padding: '8px 20px', borderRadius: 8, cursor: 'pointer' }}
+          >
+            נסה שוב
+          </button>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
 export default function App() {
-  const [profile, setProfile] = useState(EMPTY_PROFILE)
+  const [profile, setProfile]         = useState(EMPTY_PROFILE)
   const [completeness, setCompleteness] = useState(0)
-  const [jobs, setJobs] = useState([])
-  const [searchMeta, setSearchMeta] = useState({})
-  const [centerTab, setCenterTab] = useState('chat')
-  const [rightTab, setRightTab] = useState('insights')
+  const [jobs, setJobs]               = useState([])
+  const [searchMeta, setSearchMeta]   = useState({})
+  const [centerTab, setCenterTab]     = useState('chat')
+  const [rightTab, setRightTab]       = useState('insights')
   const [healthStatus, setHealthStatus] = useState({ status: 'loading' })
 
   // Check health on mount
@@ -68,16 +104,12 @@ export default function App() {
   }
 
   // Header
-  const statusDot = healthStatus.status === 'ok' ? '' :
-    healthStatus.status === 'loading' ? 'warn' : 'warn'
+  const statusDot  = healthStatus.status === 'ok' ? '' : 'warn'
   const statusText = healthStatus.status === 'ok'
     ? `שרת פעיל · ${(healthStatus.db_stats?.total_jobs || 0).toLocaleString()} משרות`
-    : healthStatus.status === 'no_zip'
-    ? 'שרת פעיל · דאטה לא נמצא'
-    : healthStatus.status === 'no_data'
-    ? 'שרת פעיל · דאטה לא עובד'
-    : healthStatus.status === 'error'
-    ? 'שרת לא נגיש'
+    : healthStatus.status === 'no_zip'  ? 'שרת פעיל · דאטה לא נמצא'
+    : healthStatus.status === 'no_data' ? 'שרת פעיל · דאטה לא עובד'
+    : healthStatus.status === 'error'   ? 'שרת לא נגיש'
     : 'מתחבר...'
 
   const header = (
@@ -147,17 +179,19 @@ export default function App() {
           </button>
         ))}
       </div>
-      {rightTab === 'insights' && <InsightsPanel />}
-      {rightTab === 'clusters' && <ClusterPanel />}
+      {rightTab === 'insights'  && <InsightsPanel />}
+      {rightTab === 'clusters'  && <ClusterPanel />}
     </>
   )
 
   return (
-    <Layout
-      header={header}
-      sidebar={sidebar}
-      center={center}
-      rightPanel={rightPanel}
-    />
+    <ErrorBoundary>
+      <Layout
+        header={header}
+        sidebar={sidebar}
+        center={center}
+        rightPanel={rightPanel}
+      />
+    </ErrorBoundary>
   )
 }

@@ -861,6 +861,24 @@ def search_jobs(profile: dict, limit: int = 10,
     scored.sort(key=lambda j: j.get("score", 0), reverse=True)
     top = scored[:limit]
 
+    # Normalize field names for frontend compatibility
+    def _normalize(job: dict) -> dict:
+        """Add frontend-friendly aliases so JobResults.jsx gets consistent field names."""
+        j = dict(job)
+        j.setdefault("title",          j.get("title_clean", ""))
+        j.setdefault("company_name",   j.get("company_clean", ""))
+        j.setdefault("location",       j.get("location_clean", ""))
+        j.setdefault("experience_level", j.get("experience_level_clean", "לא צוין"))
+        j.setdefault("work_type",      j.get("work_type_clean", "לא צוין"))
+        # match_score is 0-100 for ScoreBadge; score (0-1) is kept for sorting
+        raw_score = j.get("score", 0.0)
+        j["match_score"] = round(raw_score * 100, 1)
+        # skill_gaps → missing_skills alias used in JobCard
+        j.setdefault("missing_skills", j.get("skill_gaps") or [])
+        return j
+
+    top = [_normalize(j) for j in top]
+
     # Build metadata
     meta = {
         "candidates_scanned": len(jobs_raw),

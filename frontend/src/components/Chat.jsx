@@ -15,19 +15,30 @@ const WELCOME_MSG = {
   text: 'שלום! אני CareerFit — סוכן חכם למציאת עבודה.\n\nמה למדת ובאיזה תחום?',
 }
 
+const API_ERROR_MSG = 'נתקלתי בבעיה רגעית, אבל אפשר להמשיך. נסי לנסח שוב או לבחור כיוון קרוב.'
+
 export default function Chat({ profile, onProfileUpdate, onJobsUpdate }) {
   const [messages, setMessages] = useState([WELCOME_MSG])
-  const [input, setInput] = useState('')
-  const [loading, setLoading] = useState(false)
+  const [input, setInput]       = useState('')
+  const [loading, setLoading]   = useState(false)
   const bottomRef = useRef(null)
-  const inputRef = useRef(null)
+  const inputRef  = useRef(null)
 
+  // Auto-scroll to bottom whenever messages change
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, loading])
 
+  // Re-focus input whenever loading finishes (after bot reply rendered)
+  useEffect(() => {
+    if (!loading) {
+      const t = setTimeout(() => inputRef.current?.focus(), 50)
+      return () => clearTimeout(t)
+    }
+  }, [loading])
+
   async function sendMessage(text) {
-    const msg = text || input.trim()
+    const msg = (text || input).trim()
     if (!msg || loading) return
     setInput('')
 
@@ -37,24 +48,25 @@ export default function Chat({ profile, onProfileUpdate, onJobsUpdate }) {
     try {
       const res = await api.chat(msg, profile)
 
-      // Debug logs
-      console.log('[CareerFit] Intent:', res.intent)
-      console.log('[CareerFit] Profile updated:', res.profile_updated, '| Changed:', res.changed_fields)
-      console.log('[CareerFit] should_clear_jobs:', res.should_clear_jobs)
-      console.log('[CareerFit] Jobs returned:', res.jobs?.length ?? 0)
-      console.log('[CareerFit] Profile:', res.profile)
+      console.log('[CareerFit] Intent:', res?.intent)
+      console.log('[CareerFit] Profile updated:', res?.profile_updated, '| Changed:', res?.changed_fields)
+      console.log('[CareerFit] should_clear_jobs:', res?.should_clear_jobs)
+      console.log('[CareerFit] Jobs returned:', res?.jobs?.length ?? 0)
 
-      setMessages(prev => [...prev, { role: 'agent', text: res.reply }])
-      if (res.profile) onProfileUpdate(res.profile, res.profile_completeness)
+      const replyText = res?.reply || res?.message || API_ERROR_MSG
 
-      // Clear stale jobs when career direction changed
-      if (res.should_clear_jobs) {
+      setMessages(prev => [...prev, { role: 'agent', text: replyText }])
+
+      if (res?.profile) onProfileUpdate(res.profile, res.profile_completeness ?? 0)
+
+      if (res?.should_clear_jobs) {
         onJobsUpdate(res.jobs || [], res.search_metadata || {}, true)
-      } else if (res.jobs && res.jobs.length > 0) {
+      } else if (Array.isArray(res?.jobs) && res.jobs.length > 0) {
         onJobsUpdate(res.jobs, res.search_metadata || {}, false)
       }
     } catch (e) {
-      setMessages(prev => [...prev, { role: 'system', text: e.message }])
+      console.error('[CareerFit] API error:', e)
+      setMessages(prev => [...prev, { role: 'system', text: API_ERROR_MSG }])
     } finally {
       setLoading(false)
       inputRef.current?.focus()
@@ -71,17 +83,20 @@ export default function Chat({ profile, onProfileUpdate, onJobsUpdate }) {
   return (
     <div className="chat-container">
       <div className="chat-messages">
-        {messages.map((m, i) => (
-          <div key={i} className={`chat-message ${m.role}`}>
-            {m.role === 'agent' && (
-              <div className="msg-sender">🤖 CareerFit</div>
-            )}
-            {m.role === 'user' && (
-              <div className="msg-sender" style={{ textAlign: 'left' }}>אתה/את</div>
-            )}
-            {m.text}
-          </div>
-        ))}
+        {messages.map((m, i) => {
+          const safeText = m?.text ?? ''
+          return (
+            <div key={i} className={`chat-message ${m?.role ?? 'agent'}`}>
+              {m?.role === 'agent' && (
+                <div className="msg-sender">CareerFit</div>
+              )}
+              {m?.role === 'user' && (
+                <div className="msg-sender" style={{ textAlign: 'left' }}>אתה/את</div>
+              )}
+              {safeText}
+            </div>
+          )
+        })}
         {loading && (
           <div className="typing-indicator">
             <div className="typing-dot" />

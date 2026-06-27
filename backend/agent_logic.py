@@ -677,6 +677,16 @@ def generate_reply(intent: str, message: str, profile: dict, updates: dict,
                     else "Found matching jobs, ranked by profile fit.")
         if open_to_all:
             return (DIRECTION_MISSING_Q_HE if lang != "English" else DIRECTION_MISSING_Q_EN)
+        # People-oriented profile: suggest concrete roles instead of blank failure
+        if _is_people_oriented(profile):
+            return _people_oriented_reply(profile, lang)
+        ci = profile.get("career_interests", [])
+        if ci and lang != "English":
+            direction_txt = _join(ci, 2)
+            return (
+                "זה פחות מתאים להתאמה מדויקת במאגר הנוכחי, אבל לפי מה שסיפרת אפשר לחשוב על "
+                "כיוונים קרובים יותר: " + direction_txt + ". רוצה לשנות כיוון או אזור?"
+            )
         return ("לא מצאתי משרות מתאימות במאגר הנוכחי, אבל אפשר לשנות תחום/אזור ולנסות שוב."
                 if lang != "English"
                 else "No matching jobs found in the current database. Try a different field or region.")
@@ -991,6 +1001,43 @@ def _handle_pending_confirmation(message: str, profile: dict, lang: str) -> Opti
 # Main entry point
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# People-oriented career suggestion helper
+# ---------------------------------------------------------------------------
+
+_PEOPLE_CAREERS_HE = [
+    "Customer Success", "שירות לקוחות", "תפקידי HR/גיוס",
+    "הטמעה והדרכה", "ניהול לקוחות (Account Manager)",
+    "רכז/ת פרויקטים", "ניהול תפעולי",
+]
+_PEOPLE_SUGGEST_HE = (
+    "לפי מה שסיפרת, הכיוונים שיכולים להתאים לך:\n• "
+    + "\n• ".join(_PEOPLE_CAREERS_HE)
+    + "\nרוצה שאחפש משרות בכיוון ספציפי?"
+)
+_PEOPLE_Q_HE = "מה מהדברים האלה נשמע לך הכי טוב: עבודה מול לקוחות, הדרכה/הטמעה, HR/גיוס, או ניהול פרויקטים?"
+
+
+def _people_oriented_reply(profile: dict, lang: str) -> str:
+    """Return a helpful reply when user is people-oriented but no jobs matched."""
+    if lang == "English":
+        return (
+            "Based on your people-oriented preference, good directions include: "
+            "Customer Success, Account Management, HR/Recruiting, Training/Implementation, "
+            "Project Coordination, or Support. Want me to search for one of these?"
+        )
+    return _PEOPLE_SUGGEST_HE
+
+
+def _is_people_oriented(profile: dict) -> bool:
+    """True if the profile has people-facing career interests."""
+    people_kws = {"שירות לקוחות", "customer success", "משאבי אנוש", "הדרכה",
+                  "hr", "recruiting", "people", "account manager", "תפעול",
+                  "project coordinator", "עבודת צוות"}
+    ci = {x.lower() for x in profile.get("career_interests", [])}
+    return bool(ci & people_kws) or profile.get("profile_signals", {}).get("people_oriented")
+
+
 def process_message(message: str, profile: Optional[dict] = None) -> dict:
     if profile is None:
         profile = empty_profile()
@@ -1239,13 +1286,40 @@ def process_message(message: str, profile: Optional[dict] = None) -> dict:
     changed_fields = [k for k in updates if k not in
                       ("conversation", "_soft", "_edu_reply_hint", "_domain_answered", "_domain_reply_hint")]
 
+    # Guard: reply must never be None or empty
+    if not reply:
+        reply = ("נתקלתי בבעיה רגעית, אבל אפשר להמשיך. לפי מה שסיפרת, ננסה לדייק כיוון קריירה קרוב יותר."
+                 if lang != "English"
+                 else "I hit a temporary issue but we can continue. Let's find a closer career direction.")
+
     return {
-        "reply": reply, "profile": profile, "jobs": jobs, "intent": intent,
-        "search_metadata": search_metadata, "insights": {},
+        "reply": reply, "profile": profile, "jobs": jobs or [], "intent": intent,
+        "search_metadata": search_metadata or {}, "insights": {},
         "profile_completeness": completeness,
-        "profile_updated": bool(changed_fields), "changed_fields": changed_fields,
+        "profile_updated": bool(changed_fields), "changed_fields": changed_fields or [],
         "should_clear_jobs": should_clear_jobs,
-        "dataset_search_ran": search_metadata.get("dataset_search_ran", False),
-        "candidates_scanned": search_metadata.get("candidates_scanned", 0),
-        "results_count": search_metadata.get("results_count", 0),
+        "dataset_search_ran": search_metadata.get("dataset_search_ran", False) if search_metadata else False,
+        "candidates_scanned": search_metadata.get("candidates_scanned", 0) if search_metadata else 0,
+        "results_count": search_metadata.get("results_count", 0) if search_metadata else 0,
     }
+
+
+def _safe_process_message(message: str, profile: Optional[dict] = None) -> dict:
+    """process_message wrapped in a top-level try/except so callers always get a valid dict."""
+    try:
+        return process_message(message, profile)
+    except Exception as exc:
+        import traceback
+        logger.error("process_message crash: %s\n%s", exc, traceback.format_exc())
+        safe_profile = profile or empty_profile()
+        lang = safe_profile.get("conversation", {}).get("language", "Hebrew")
+        fallback = ("נתקלתי בבעיה רגעית, אבל אפשר להמשיך. לפי מה שסיפרת, ננסה לדייק כיוון קריירה קרוב יותר."
+                    if lang != "English"
+                    else "Temporary issue — let's continue and find a closer career direction.")
+        return {
+            "reply": fallback, "profile": safe_profile, "jobs": [],
+            "intent": "error", "search_metadata": {}, "insights": {},
+            "profile_completeness": 0, "profile_updated": False,
+            "changed_fields": [], "should_clear_jobs": False,
+            "dataset_search_ran": False, "candidates_scanned": 0, "results_count": 0,
+        }

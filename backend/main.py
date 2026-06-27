@@ -238,17 +238,23 @@ def reset_profile():
 def chat(req: ChatRequest):
     """Main conversational endpoint."""
     try:
-        from agent_logic import process_message
+        from agent_logic import _safe_process_message
         profile = req.profile if req.profile else empty_profile()
-        result = process_message(req.message, profile)
+        result = _safe_process_message(req.message, profile)
         return ChatResponse(**result)
     except Exception as e:
-        logger.error("Chat error: %s", e, exc_info=True)
+        import traceback
+        logger.error("Chat endpoint crash: %s\n%s", e, traceback.format_exc())
         return ChatResponse(
-            reply="מצטער/ת, אירעה שגיאה. נסה/י שוב.",
+            reply="נתקלתי בבעיה רגעית, אבל אפשר להמשיך. לפי מה שסיפרת, ננסה לדייק כיוון קריירה קרוב יותר.",
             profile=req.profile or empty_profile(),
+            jobs=[],
             intent="error",
+            search_metadata={},
+            insights={},
             profile_completeness=0,
+            profile_updated=False,
+            should_clear_jobs=False,
         )
 
 

@@ -638,10 +638,20 @@ DOMAIN_SKILL_MAP = [
             r"לעבוד עם אנשים", r"אוהב[תי]?\s+אנשים",
             r"working with people", r"helping people",
             r"לעזור לאנשים", r"עבודה עם אנשים",
+            r"^עבודת\s+צוות$", r"לעבוד\s+(?:בצוות|עם\s+צוות)",
+            r"team\s*work", r"עבודה\s+(?:בצוות|עם\s+אנשים)",
+            r"שירות\s+לקוחות", r"לקוחות", r"customer\s+(?:service|success|support|facing)",
+            r"הדרכה", r"הטמעה", r"training", r"implementation",
+            r"ניהול\s+לקוחות", r"account\s+manag",
+            r"רכז[תי]?\s+פרויקט", r"project\s+coord",
         ],
-        "career_interests": ["משאבי אנוש", "שירות לקוחות", "הדרכה", "Customer Success"],
+        "career_interests": [
+            "שירות לקוחות", "Customer Success", "משאבי אנוש",
+            "הדרכה והטמעה", "ניהול לקוחות", "רכז פרויקטים",
+        ],
         "skills": [],
-        "reply_he": "מתאים למשאבי אנוש, שירות לקוחות, הדרכה או Customer Success.",
+        "reply_he": "מתאים לשירות לקוחות, Customer Success, HR, הדרכה/הטמעה, ניהול לקוחות או רכז/ת פרויקטים.",
+        "people_oriented": True,
     },
     # ── HR / Recruiting ───────────────────────────────────────────────────────
     {
@@ -1105,6 +1115,10 @@ def extract_profile_updates(message: str, profile: dict) -> dict:
                     existing.append(sk)
             if not reply_hint:
                 reply_hint = entry.get("reply_he", "")
+            # Propagate people_oriented flag into profile_signals
+            if entry.get("people_oriented"):
+                ps = updates.setdefault("profile_signals", {})
+                ps["people_oriented"] = True
 
     # Education-based career inference (only when no specific interests found yet)
     edu_hint: str = ""
