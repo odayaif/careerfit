@@ -26,7 +26,7 @@ ZIP_PATH = os.path.join(_PROJECT_ROOT, "data", "archive.zip")
 # ---------------------------------------------------------------------------
 # Imports from our modules
 # ---------------------------------------------------------------------------
-from database import db_exists, create_tables, get_db_stats
+from database import db_exists, create_tables, get_db_stats, DATA_SOURCE
 from models import (
     ChatRequest, ChatResponse, ProfileUpdateRequest,
     JobSearchRequest, empty_profile, profile_completeness
@@ -110,16 +110,27 @@ def health():
     stats = get_db_stats()
     zip_exists = os.path.exists(ZIP_PATH)
 
-    status = "ok" if data_ready else ("no_data" if zip_exists else "no_zip")
-    message = ""
-    if not zip_exists:
-        message = "השרת פעיל, אך קובץ הדאטה לא נמצא. יש להוסיף את הקובץ לנתיב data/archive.zip ולהריץ עיבוד נתונים."
-    elif not data_ready:
+    # data_source: "full" (522 MB DB), "demo" (2,500 job DB), or "empty"
+    data_source = DATA_SOURCE   # resolved at startup: full | demo | empty
+
+    if data_ready:
+        status = "ok"
+        if data_source == "demo":
+            message = "פועל במצב דמו — מוצגות משרות לדוגמה (~22,000 משרות). לחיפוש מלא יש להוסיף careerfit.db."
+        else:
+            message = ""
+    elif zip_exists:
+        status = "no_data"
         message = "הדאטה נמצא אך לא עובד. הרץ: python backend/data_pipeline.py"
+    else:
+        status = "no_data"
+        message = "אין נתונים. הרץ: python backend/create_demo_db.py לבנות בסיס דמו, או הוסף careerfit.db."
 
     return {
         "status": status,
         "data_ready": data_ready,
+        "data_source": data_source,       # "full" | "demo" | "empty"
+        "total_jobs": stats.get("total_jobs", 0),
         "zip_exists": zip_exists,
         "message": message,
         "db_stats": stats,

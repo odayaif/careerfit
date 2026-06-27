@@ -1,5 +1,10 @@
 """
 database.py — SQLite connection and table management for CareerFit
+
+DB priority (resolved at import time):
+  1. backend/careerfit.db  — full dataset (~522 MB, not committed to git)
+  2. backend/demo_jobs.db  — demo dataset (~2,500 jobs, committed to git)
+  3. None                  — empty mode (no job data available)
 """
 import sqlite3
 import os
@@ -7,9 +12,23 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Resolve DB path relative to this file's location
 _HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(_HERE, "careerfit.db")
+
+_FULL_DB = os.path.join(_HERE, "careerfit.db")
+_DEMO_DB = os.path.join(_HERE, "demo_jobs.db")
+
+
+def _resolve_db_path():
+    """Return (path, source_label) for the best available DB."""
+    if os.path.exists(_FULL_DB):
+        return _FULL_DB, "full"
+    if os.path.exists(_DEMO_DB):
+        return _DEMO_DB, "demo"
+    return _FULL_DB, "empty"   # fallback to full path even if missing (empty mode)
+
+
+DB_PATH, DATA_SOURCE = _resolve_db_path()
+logger.info("DB selected: %s (%s)", DB_PATH, DATA_SOURCE)
 
 
 def get_connection() -> sqlite3.Connection:
@@ -89,19 +108,21 @@ def create_tables():
 
 
 def get_db_stats() -> dict:
-    """Return basic statistics about the database."""
+    """Return basic statistics about the database, including data_source label."""
     if not db_exists():
-        return {"status": "missing", "total_jobs": 0}
+        return {"status": "missing", "total_jobs": 0, "data_source": DATA_SOURCE}
     try:
         with get_connection() as conn:
             total = conn.execute("SELECT COUNT(*) FROM jobs_clean").fetchone()[0]
             cats = conn.execute(
-                "SELECT job_category, COUNT(*) as cnt FROM jobs_clean GROUP BY job_category ORDER BY cnt DESC LIMIT 5"
+                "SELECT job_category, COUNT(*) as cnt FROM jobs_clean "
+                "GROUP BY job_category ORDER BY cnt DESC LIMIT 5"
             ).fetchall()
             return {
                 "status": "ok",
                 "total_jobs": total,
+                "data_source": DATA_SOURCE,    # "full" | "demo" | "empty"
                 "top_categories": [dict(r) for r in cats],
             }
     except Exception as e:
-        return {"status": "error", "error": str(e), "total_jobs": 0}
+        return {"status": "error", "error": str(e), "total_jobs": 0, "data_source": DATA_SOURCE}

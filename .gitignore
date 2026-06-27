@@ -13,10 +13,13 @@ env/
 .venv/
 .env
 
-# Database
+# Database — full dataset (too large for git)
 backend/careerfit.db
 *.db
 *.sqlite
+
+# Demo database IS committed to git (~90 MB, needed for Render)
+!backend/demo_jobs.db
 
 # Dataset
 data/archive.zip
