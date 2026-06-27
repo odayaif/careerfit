@@ -19,12 +19,45 @@ _DEMO_DB = os.path.join(_HERE, "demo_jobs.db")
 
 
 def _resolve_db_path():
-    """Return (path, source_label) for the best available DB."""
-    if os.path.exists(_FULL_DB):
-        return _FULL_DB, "full"
-    if os.path.exists(_DEMO_DB):
-        return _DEMO_DB, "demo"
-    return _FULL_DB, "empty"   # fallback to full path even if missing (empty mode)
+    """Return (path, source_label) for the best available DB.
+
+    Tries to actually open each candidate — os.path.exists() can return True
+    for cloud-synced (OneDrive/iCloud) files that aren't downloaded to disk.
+    """
+    def _can_open(p: str) -> bool:
+        try:
+            conn = sqlite3.connect(p, timeout=5)
+            conn.execute("SELECT COUNT(*) FROM jobs_clean")
+            conn.close()
+            return True
+        except Exception:
+            return False
+
+    def _try_or_copy(src_path: str) -> str | None:
+        """Return usable path (original or /tmp copy), or None if unreadable."""
+        if not os.path.exists(src_path):
+            return None
+        if _can_open(src_path):
+            return src_path
+        # Try copying to /tmp (bypasses read-only mount / journal issues)
+        import shutil, tempfile
+        tmp = os.path.join(tempfile.gettempdir(), os.path.basename(src_path))
+        try:
+            shutil.copy2(src_path, tmp)
+            if _can_open(tmp):
+                logger.info("DB copied to %s (OneDrive mount workaround)", tmp)
+                return tmp
+        except Exception as e:
+            logger.warning("DB copy to /tmp failed: %s", e)
+        return None
+
+    full = _try_or_copy(_FULL_DB)
+    if full:
+        return full, "full"
+    demo = _try_or_copy(_DEMO_DB)
+    if demo:
+        return demo, "demo"
+    return _DEMO_DB, "empty"
 
 
 DB_PATH, DATA_SOURCE = _resolve_db_path()
@@ -35,8 +68,11 @@ def get_connection() -> sqlite3.Connection:
     """Return a new SQLite connection with row_factory set."""
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass  # read-only mount (e.g. OneDrive sandbox) — continue without WAL
     return conn
 
 
@@ -45,11 +81,13 @@ def db_exists() -> bool:
     if not os.path.exists(DB_PATH):
         return False
     try:
-        with get_connection() as conn:
-            cur = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='jobs_clean'"
-            )
-            return cur.fetchone() is not None
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='jobs_clean'"
+        )
+        exists = cur.fetchone() is not None
+        conn.close()
+        return exists
     except Exception:
         return False
 
@@ -108,21 +146,22 @@ def create_tables():
 
 
 def get_db_stats() -> dict:
-    """Return basic statistics about the database, including data_source label."""
+    """Return basic statistics about the database."""
     if not db_exists():
-        return {"status": "missing", "total_jobs": 0, "data_source": DATA_SOURCE}
+        return {"total_jobs": 0, "categories": {}, "remote_count": 0}
     try:
-        with get_connection() as conn:
-            total = conn.execute("SELECT COUNT(*) FROM jobs_clean").fetchone()[0]
-            cats = conn.execute(
-                "SELECT job_category, COUNT(*) as cnt FROM jobs_clean "
-                "GROUP BY job_category ORDER BY cnt DESC LIMIT 5"
-            ).fetchall()
-            return {
-                "status": "ok",
-                "total_jobs": total,
-                "data_source": DATA_SOURCE,    # "full" | "demo" | "empty"
-                "top_categories": [dict(r) for r in cats],
-            }
+        conn = sqlite3.connect(DB_PATH)
+        total = conn.execute("SELECT COUNT(*) FROM jobs_clean").fetchone()[0]
+        cats  = conn.execute(
+            "SELECT job_category, COUNT(*) c FROM jobs_clean GROUP BY job_category ORDER BY c DESC LIMIT 20"
+        ).fetchall()
+        remote = conn.execute("SELECT COUNT(*) FROM jobs_clean WHERE is_remote=1").fetchone()[0]
+        conn.close()
+        return {
+            "total_jobs": total,
+            "categories": {c: n for c, n in cats},
+            "remote_count": remote,
+        }
     except Exception as e:
-        return {"status": "error", "error": str(e), "total_jobs": 0, "data_source": DATA_SOURCE}
+        logger.error("get_db_stats error: %s", e)
+        return {"total_jobs": 0, "categories": {}, "remote_count": 0}

@@ -1008,10 +1008,11 @@ TEACHING_SIGNALS = [
 ]
 
 
+
 def _extract_role_phrases(text):
     """Extract free-text role descriptions after role-signaling phrases."""
     patterns = [
-        r"(?:רוצ[הי]|רצ[הי]|מעוניינ[תי]?) (?:להיות|לעבוד כ[ּ]?|לעסוק ב)\s*([^\.,\n]{3,50})",
+        r"(?:רוצ[הי]|רצ[הי]|מעוניינ[תי]?) (?:להיות|לעבוד כ[דּ]?|לעסוק ב)\s*([^\.,\n]{3,50})",
         r"(?:want to be|want to become|interested in being|i want to be)\s+([^\.,\n]{3,50})",
         r"(?:אני מחפש[תי]?|looking for|מחפש[תי]?) (?:תפקיד של|עבודה כ|a job as|work as|position as)\s*([^\.,\n]{3,50})",
         r"(?:מעניין אותי|interested in|רוצה לעבוד כ)\s+([^\.,\n]{3,50})",
@@ -1019,633 +1020,225 @@ def _extract_role_phrases(text):
     phrases = []
     for pat in patterns:
         for m in re.finditer(pat, text, re.IGNORECASE):
-            phrase = m.group(1).strip().strip("'\".,")
-            if 3 < len(phrase) < 60:
+            phrase = m.group(1).strip().rstrip(".,?!")
+            if phrase:
                 phrases.append(phrase)
     return phrases
 
 
-def extract_career_interests(text):
-    """Extract career interests. Returns list of interest tags + free-text roles."""
-    # Guard: if message is purely about avoidance, skip
-    if re.search(
-        r"(?:^|\s)(?:לא רוצ[הי]|don.?t want|avoid|לא מעוניינ|not interested|אין לי עניין)(?:\s|$)",
-        text, re.IGNORECASE
-    ) and not re.search(
-        r"(?:רוצ[הי]|want|מעניין|interested)\s+(?!לא)", text, re.IGNORECASE
-    ):
-        return []
-
-    tl = text.lower()
-    found = []
-
-    # 1. Match against interest_re capture groups (explicit "I want X" phrases)
-    interest_re = re.findall(
-        r"(?:רוצ[הי]|מחפש[תי]?|interested in|want a?n?\s+|looking for|prefer|מעניין אותי|אני מחפש)"
-        r"\s+([^\.\n,]{3,60})",
-        text, re.IGNORECASE
-    )
-    for chunk in interest_re:
-        cl = chunk.lower()
-        for cat, kws in INTEREST_KEYWORDS.items():
-            if any(kw.lower() in cl for kw in kws):
-                if cat not in found:
-                    found.append(cat)
-
-    # 2. Broad keyword scan
-    for cat, kws in INTEREST_KEYWORDS.items():
-        if any(kw.lower() in tl for kw in kws) and cat not in found:
-            found.append(cat)
-
-    # 3. Special: detect teaching role even without explicit interest phrase
-    if any(kw.lower() in tl for kw in TEACHING_SIGNALS):
-        if "חינוך" not in found:
-            found.append("חינוך")
-
-    # 4. Extract free-text role phrases (stored directly so matching engine can use them)
-    role_phrases = _extract_role_phrases(text)
-    for phrase in role_phrases:
-        pl = phrase.lower()
-        # Avoid duplicating already-mapped categories
-        if not any(pl in cat.lower() or cat.lower() in pl for cat in found):
-            found.append(phrase)
-
-    return found[:6]
-
-
 # ---------------------------------------------------------------------------
-# Career direction change detection
+# High-level profile extraction
 # ---------------------------------------------------------------------------
 
-CAREER_CHANGE_PATTERNS = [
-    r"\bבעצם\b",
-    r"משנ[הי] כיוון",
-    r"לא דאטה",
-    r"לא sql",
-    r"לא פיתוח",
-    r"לא מכירות",
-    r"(?:אני )?רוצ[הי] להיות",
-    r"(?:אני )?מעדיפ[הי]? להיות",
-    r"(?:אני )?מחפש[תי]? עכשיו",
-    r"שינית[יי]? דעה|שינוי כיוון",
-    r"\bforget that\b",
-    r"\bactually\b",
-    r"\binstead\b",
-    r"\bi want to be\b",
-    r"\bi changed my mind\b",
-    r"\bnot data\b",
-    r"\bnot sql\b",
-    r"\bnot (a )?developer\b",
-    r"different (field|career|direction|role)",
-    r"כיוון אחר|תחום אחר",
-    r"לא בתחום ה",
-    r"במקום (דאטה|פיתוח|sql|מכירות)",
-    r"העדפה חדשה|כוון אחר",
-]
-
-
-def detect_career_direction_change(message: str, current_profile: dict) -> bool:
+def extract_profile_updates(message: str, profile: dict) -> dict:
     """
-    Returns True if the user is clearly pivoting to a different career direction.
-    Also returns True if they explicitly name a new role that contradicts existing interests.
+    Extract all profile fields from a user message.
+    Returns a dict with detected fields; empty keys are omitted.
+    Special internal keys (prefixed with _) carry signals for agent_logic.
     """
-    tl = message.lower()
-    for pat in CAREER_CHANGE_PATTERNS:
-        if re.search(pat, tl, re.IGNORECASE):
-            return True
+    updates: dict = {}
+    tl = message.strip()
 
-    # Check if user mentions a category that is completely different from existing interests
-    current_interests = current_profile.get("career_interests", [])
-    if not current_interests:
-        return False
+    # Skills
+    skills = extract_skills(tl)
+    if skills:
+        updates["skills"] = list(skills)
 
-    new_interests = extract_career_interests(message)
-    if not new_interests:
-        return False
-
-    # If ALL new interests are different from ALL current interests, it's a direction change
-    current_lower = set(ci.lower() for ci in current_interests)
-    new_lower = set(ni.lower() for ni in new_interests)
-    overlap = current_lower & new_lower
-    # No overlap → direction change; small overlap with "גם" → not a change
-    has_also = bool(re.search(r"\bגם\b|\balso\b|\band\b", tl))
-    if not overlap and not has_also and new_interests:
-        return True
-
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Constraints
-# ---------------------------------------------------------------------------
-
-def extract_constraints(text):
-    result = {"avoid": [], "must_have": []}
-    tl = text.lower()
-    avoid_subjects = {
-        "מכירות": ["sales","מכירות","selling"],
-        "משמרות": ["shifts","משמרות","night shift"],
-        "נסיעות ארוכות": ["long commute","נסיעות ארוכות"],
-        "עבודה פיזית": ["physical work","פיזי","warehouse"],
-    }
-    has_avoid = bool(re.search(
-        r"לא רוצ[הי]|don.?t want|avoid|לא מעוניינ|not interested",
-        tl, re.IGNORECASE
-    ))
-    if has_avoid:
-        for label, keywords in avoid_subjects.items():
-            if any(kw in tl for kw in keywords):
-                if label not in result["avoid"]:
-                    result["avoid"].append(label)
-    if re.search(r"חייב|must have|required|דרוש", tl):
-        if re.search(r"remote|מרחוק", tl):
-            result["must_have"].append("מרחוק")
-        if re.search(r"hybrid|היברידי", tl):
-            result["must_have"].append("היברידי")
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Main profile extraction and merge
-# ---------------------------------------------------------------------------
-
-def extract_profile_updates(message, current_profile):
-    """Extract all profile updates from a message.
-    Handles formal fields, education→career inference, domain skill words,
-    student detection, and soft/semantic signals."""
-    updates = {}
-    lang = detect_language(message)
-    updates["conversation"] = {"language": lang}
-
-    edu = extract_education(message)
+    # Education
+    edu = extract_education(tl)
     if edu:
         updates["education"] = edu
 
-    exp = extract_experience(message)
+    # Experience
+    exp = extract_experience(tl)
     if exp:
         updates["experience"] = exp
 
-    skills = extract_skills(message)
-    if skills:
-        updates["skills"] = skills
+    # Salary
+    sal = extract_salary(tl)
+    if sal:
+        updates["salary_expectation"] = sal
 
-    # ── Student detection ─────────────────────────────────────────────────────
-    _is_student = bool(re.search(
-        r"\bסטודנט[ית]?\b|\bלומד[ת]\b|\bstudent\b|\bstudying\b|\bשנה [א-ד]\b",
-        message, re.IGNORECASE
-    ))
-    if _is_student:
-        exp_upd = updates.setdefault("experience", {})
-        if not exp_upd.get("seniority") and not current_profile.get("experience", {}).get("seniority"):
-            exp_upd["seniority"] = "סטודנט/ית"
-        if exp_upd.get("years") is None and current_profile.get("experience", {}).get("years") is None:
-            exp_upd["years"] = 0
+    # Work preferences
+    wp = extract_work_preferences(tl)
+    if wp:
+        updates["work_preferences"] = wp
 
-    # Detect career direction change BEFORE extracting interests
-    direction_changed = detect_career_direction_change(message, current_profile)
+    # Country preference
+    country = extract_country_preference(tl)
+    if country:
+        updates["country_preference"] = country
 
-    interests = extract_career_interests(message)
-    if interests:
-        updates["career_interests"] = interests
-        if direction_changed:
-            updates["career_direction_changed"] = True
-
-    # ── Education → career direction inference ────────────────────────────────
-    # Guard: only infer career direction from education field when the user is
-    # actually talking about their own study background (has degree or is a student).
-    # A field appearing alone (e.g. "מתמטיקה" in "מורה למתמטיקה") should NOT
-    # trigger career-direction inference — the field is the teaching subject, not
-    # the user's degree.
-    edu_has_study_context = bool(
-        (edu or {}).get("degree") or (edu or {}).get("status") or _is_student
-    )
-    # When using the current profile's stored field, context is already established
-    _stored_edu_field = current_profile.get("education", {}).get("field")
-    edu_field = (edu or {}).get("field") if edu_has_study_context else None
-    if edu_field is None and _stored_edu_field:
-        edu_field = _stored_edu_field  # carry-forward from previous turn (safe)
-
-    if edu_field and edu_field in EDUCATION_CAREER_MAP and edu_has_study_context:
-        mapping = EDUCATION_CAREER_MAP[edu_field]
-        existing = current_profile.get("career_interests", [])
-        cur_ci = updates.get("career_interests", list(existing))
-        new_from_edu = [i for i in mapping["career_interests"] if i not in cur_ci]
-        if new_from_edu:
-            updates["career_interests"] = cur_ci + new_from_edu
-        # Only emit the smart reply hint when education was freshly mentioned
-        if edu and edu_has_study_context and not direction_changed:
-            updates["_edu_reply_hint"] = mapping["reply_he"]
-
-    # ── Profession/role phrases → career interests (PRIORITY over DOMAIN_SKILL_MAP) ─
-    # Catches specific job titles and role descriptions:
-    # "מנהלת משרד", "רכזת גיוס", "עורך דין", "business administration" etc.
-    tl_msg = message.lower()
-    _prof_matched = False
-    for pm_entry in PROFESSION_MAP:
-        if any(re.search(pat, tl_msg, re.IGNORECASE) for pat in pm_entry["patterns"]):
-            existing_ci = current_profile.get("career_interests", [])
-            cur_ci = updates.get("career_interests", list(existing_ci))
-            new_interests = [i for i in pm_entry["career_interests"] if i not in cur_ci]
-            if new_interests:
-                updates["career_interests"] = cur_ci + new_interests
-            updates["_domain_answered"] = True
-            hint = pm_entry.get("reply_he", "")
-            if hint:
-                updates["_domain_reply_hint"] = hint
-            _prof_matched = True
-            break  # Most specific match wins
-
-    # ── Generic domain/skill words → career interests ─────────────────────────
-    # Catches words like "תכנות", "עיצוב", "דאטה", "SQL" the user says informally.
-    # Only scanned when PROFESSION_MAP had no match.
-    if not _prof_matched:
-        for dm_entry in DOMAIN_SKILL_MAP:
-            if any(re.search(pat, tl_msg, re.IGNORECASE) for pat in dm_entry["patterns"]):
-                existing_ci = current_profile.get("career_interests", [])
-                cur_ci = updates.get("career_interests", list(existing_ci))
-                new_interests = [i for i in dm_entry["career_interests"] if i not in cur_ci]
-                if new_interests:
-                    updates["career_interests"] = cur_ci + new_interests
-                for s in dm_entry.get("skills", []):
-                    existing_sk = current_profile.get("skills", []) + updates.get("skills", [])
-                    if s not in existing_sk:
-                        updates.setdefault("skills", list(current_profile.get("skills", [])))
-                        updates["skills"].append(s)
-                updates["_domain_answered"] = True
-                # Carry skill-level domain inference reply (e.g. "SQL מתאים לדאטה, BI.")
-                hint = dm_entry.get("reply_he", "")
-                if hint and not updates.get("_domain_reply_hint"):
-                    updates["_domain_reply_hint"] = hint
-                # No break — scan all entries so multi-domain messages (e.g. "SQL QA") get all interests
-
-    # ── Open-to-all detection ─────────────────────────────────────────────────
-    # Must run BEFORE DOMAIN_SKILL_MAP so "הכל" doesn't pick up a domain keyword.
-    if is_open_to_all(message):
-        updates["open_to_all"] = True
-        # Don't add career_interests — they stay empty so the agent asks a broad Q
-
-    salary = extract_salary(message)
-    if salary:
-        updates["salary_expectation"] = salary
-
-    # ── Work preferences (type + mode) ────────────────────────────────────────
-    work_prefs = extract_work_preferences(message)
-    if work_prefs:
-        existing_wp = current_profile.get("work_preferences", {})
-        merged_wp = {**existing_wp, **work_prefs}
-        updates["work_preferences"] = merged_wp
-
-    # ── Country preference ────────────────────────────────────────────────────
-    # Must run before location so we know whether to capture Israeli area.
-    country_pref = extract_country_preference(message)
-    if country_pref:
-        updates["country_preference"] = country_pref
-
-    # ── Location / area (Israeli) ─────────────────────────────────────────────
-    # Only extract an Israeli area when:
-    #   (a) user already has country=Israel, OR
-    #   (b) an Israeli area keyword is detected and no country yet (→ infer Israel)
-    # Do NOT set location_area for US or Global searches.
-    loc = extract_location(message)
+    # Location
+    loc = extract_location(tl)
     if loc:
-        current_country = current_profile.get("country_preference", "") or country_pref or ""
-        # Detect whether a concrete Israeli area was found (not just "מרחוק")
-        has_israel_area = "primary" in loc and loc["primary"] != "מרחוק"
+        updates["location_preference"] = loc
 
-        # If no country set yet but Israeli area detected → infer Israel
-        if has_israel_area and not current_country:
-            updates.setdefault("country_preference", "Israel")
-            current_country = "Israel"
+    # Open-to-all
+    if is_open_to_all(tl):
+        updates["open_to_all"] = True
 
-        # Only store area when relevant to Israel
-        area_relevant = (current_country in ("Israel", ""))
-        loc_upd = {}
-        if area_relevant:
-            if "primary" in loc:
-                loc_upd["primary"] = loc["primary"]
-            if "fallbacks" in loc:
-                loc_upd["fallbacks"] = loc["fallbacks"]
-        if "remote_allowed" in loc:
-            loc_upd["remote_allowed"] = loc["remote_allowed"]
-        ws_upd = {}
-        if "preferred_environment" in loc:
-            ws_upd["preferred_environment"] = loc["preferred_environment"]
-        if loc_upd:
-            updates["location_preference"] = loc_upd
-        if ws_upd:
-            updates["work_style"] = ws_upd
+    # Career interests --- scan PROFESSION_MAP first (higher specificity)
+    detected_interests: list = []
+    detected_domain: Optional[str] = None
+    reply_hint: str = ""
 
-    constraints = extract_constraints(message)
-    if constraints["avoid"] or constraints["must_have"]:
-        updates["constraints"] = constraints
+    for entry in PROFESSION_MAP:
+        if any(re.search(p, tl, re.IGNORECASE) for p in entry["patterns"]):
+            for ci in entry.get("career_interests", []):
+                if ci not in detected_interests:
+                    detected_interests.append(ci)
+            if not detected_domain:
+                detected_domain = entry.get("domain", "")
+            if not reply_hint:
+                reply_hint = entry.get("reply_he", "")
 
-    # --- Soft / semantic signal extraction ---
-    soft = interpret_free_text_signal(message, current_profile)
+    # Then scan DOMAIN_SKILL_MAP (generic skill/domain words)
+    for entry in DOMAIN_SKILL_MAP:
+        if any(re.search(p, tl, re.IGNORECASE) for p in entry["patterns"]):
+            for ci in entry.get("career_interests", []):
+                if ci not in detected_interests:
+                    detected_interests.append(ci)
+            for sk in entry.get("skills", []):
+                existing = updates.setdefault("skills", [])
+                if sk not in existing:
+                    existing.append(sk)
+            if not reply_hint:
+                reply_hint = entry.get("reply_he", "")
+
+    # Education-based career inference (only when no specific interests found yet)
+    edu_hint: str = ""
+    if not detected_interests and edu:
+        field = (edu.get("field") or "").strip()
+        degree = (edu.get("degree") or "").strip()
+        for key, mapping in EDUCATION_CAREER_MAP.items():
+            if key.lower() in field.lower() or key.lower() in degree.lower():
+                for ci in mapping.get("career_interests", []):
+                    if ci not in detected_interests:
+                        detected_interests.append(ci)
+                edu_hint = mapping.get("reply_he", "")
+                break
+
+    # Teaching signals
+    if not detected_interests:
+        tl_low = tl.lower()
+        if any(sig.lower() in tl_low for sig in TEACHING_SIGNALS):
+            detected_interests = ["חינוך", "הוראה"]
+            detected_domain = "education"
+
+    if detected_interests:
+        updates["career_interests"] = detected_interests
+
+    # Soft signals
+    role_phrases = _extract_role_phrases(tl)
+    soft: dict = {}
+    if role_phrases and not detected_interests:
+        possible_dirs: list = []
+        phrase_text = " ".join(role_phrases).lower()
+        for entry in DOMAIN_SKILL_MAP:
+            if any(re.search(p, phrase_text, re.IGNORECASE) for p in entry["patterns"]):
+                for ci in entry.get("career_interests", []):
+                    if ci not in possible_dirs:
+                        possible_dirs.append(ci)
+        if possible_dirs:
+            soft = {"possible_career_directions": possible_dirs}
+        else:
+            soft = {"reply_hint": "uncertainty"}
+
+    # Internal signals for agent_logic
     if soft:
-        updates["_soft"] = soft  # passed through to agent_logic
+        updates["_last_soft"] = soft
+    if edu_hint:
+        updates["_edu_reply_hint"] = edu_hint
+    if detected_domain:
+        updates["_domain_answered"] = True
+    if reply_hint:
+        updates["_domain_reply_hint"] = reply_hint
 
     return updates
 
 
-def merge_profile_updates(current, updates):
+# ---------------------------------------------------------------------------
+# Profile merge
+# ---------------------------------------------------------------------------
+
+def merge_profile_updates(profile: dict, updates: dict) -> dict:
     """
-    Merge updates into current profile.
-    - If career_direction_changed=True, REPLACE career_interests instead of appending.
-    - profile_signals are merged list-by-list (append, dedupe).
-    - _soft, _edu_reply_hint, _domain_answered are consumed here and passed via conversation.
+    Merge extracted updates into the existing profile.
+    Handles list merging (skills, career_interests) without duplicates.
+    Returns the modified profile.
     """
-    profile = copy.deepcopy(current)
-    direction_changed = updates.pop("career_direction_changed", False)
-    soft = updates.pop("_soft", {})  # consumed by agent_logic
-    edu_reply_hint = updates.pop("_edu_reply_hint", "")
-    domain_answered = updates.pop("_domain_answered", False)
-    domain_reply_hint = updates.pop("_domain_reply_hint", "")  # skill-level ack
+    if not updates:
+        return profile
 
-    def merge_list(base_list, new_list):
-        return base_list + [x for x in new_list if x not in base_list]
+    profile = copy.deepcopy(profile)
+    conv = profile.setdefault("conversation", {})
 
-    def merge_dict(base, upd):
-        for k, v in upd.items():
-            if k == "career_interests" and direction_changed:
-                base[k] = v
-            elif k == "profile_signals" and isinstance(v, dict):
-                # Deep merge profile_signals lists
-                ps = base.setdefault("profile_signals", {})
-                for sig_type, sig_vals in v.items():
-                    ps[sig_type] = merge_list(ps.get(sig_type, []), sig_vals)
-            elif isinstance(v, dict) and isinstance(base.get(k), dict):
-                merge_dict(base[k], v)
-            elif isinstance(v, list) and isinstance(base.get(k), list):
-                base[k] = merge_list(base[k], v)
-            else:
-                if v is not None and v != "" and v != []:
-                    base[k] = v
+    # Extract internal signals
+    soft        = updates.pop("_last_soft", {})
+    edu_hint    = updates.pop("_edu_reply_hint", "")
+    domain_ans  = updates.pop("_domain_answered", False)
+    domain_hint = updates.pop("_domain_reply_hint", "")
 
-    merge_dict(profile, updates)
-
-    # Merge profile_signals from soft signals
-    if soft.get("profile_signals"):
-        ps = profile.setdefault("profile_signals", {})
-        for sig_type, sig_vals in soft["profile_signals"].items():
-            ps[sig_type] = merge_list(ps.get(sig_type, []), sig_vals)
-
-    # Merge avoidance from soft signals
-    if soft.get("add_constraints_avoid"):
-        avoid = profile.setdefault("constraints", {}).setdefault("avoid", [])
-        for a in soft["add_constraints_avoid"]:
-            if a not in avoid:
-                avoid.append(a)
-
-    # Store direction change flag for agent_logic
-    if direction_changed:
-        profile.setdefault("conversation", {})["career_direction_changed"] = True
-    else:
-        profile.setdefault("conversation", {}).pop("career_direction_changed", None)
-
-    # Pass meta signals through conversation for agent_logic to read
     if soft:
-        profile.setdefault("conversation", {})["_last_soft"] = soft
-    if edu_reply_hint:
-        profile.setdefault("conversation", {})["_edu_reply_hint"] = edu_reply_hint
-    if domain_answered:
-        profile.setdefault("conversation", {})["_domain_answered"] = True
-    if domain_reply_hint:
-        profile.setdefault("conversation", {})["_domain_reply_hint"] = domain_reply_hint
+        conv["_last_soft"] = soft
+    if edu_hint:
+        conv["_edu_reply_hint"] = edu_hint
+    if domain_ans:
+        conv["_domain_answered"] = True
+    if domain_hint:
+        conv["_domain_reply_hint"] = domain_hint
+
+    # Career direction change detection
+    old_interests = set(profile.get("career_interests", []))
+    new_interests = set(updates.get("career_interests", []))
+    if new_interests and old_interests and not new_interests.issubset(old_interests):
+        if not (new_interests & old_interests):
+            conv["career_direction_changed"] = True
+
+    # Scalar fields
+    for field in ("country_preference", "open_to_all"):
+        if field in updates:
+            profile[field] = updates[field]
+
+    # List fields (no duplicates)
+    for field in ("skills", "career_interests"):
+        if field in updates:
+            existing = profile.get(field, [])
+            merged = list(existing)
+            for v in updates[field]:
+                if v not in merged:
+                    merged.append(v)
+            profile[field] = merged
+
+    # Nested dicts
+    for field in ("education", "experience", "salary_expectation",
+                  "work_preferences", "location_preference"):
+        if field in updates:
+            existing = profile.get(field, {})
+            if not isinstance(existing, dict):
+                existing = {}
+            profile[field] = {**existing, **updates[field]}
+
+    loc_pref = profile.get("location_preference", {})
+    if loc_pref.get("preferred_environment"):
+        ws = profile.setdefault("work_style", {})
+        ws["preferred_environment"] = loc_pref["preferred_environment"]
 
     return profile
 
 
-def build_profile_text(profile):
-    """Build a text representation of the profile for TF-IDF matching.
-    Career interests are repeated 3× for stronger signal.
-    Confirmed soft signals (interests) also included."""
-    parts = []
-
-    # Career interests: repeat 3× for stronger signal
-    interests = profile.get("career_interests", [])
-    for _ in range(3):
-        parts.extend(interests)
-
-    # Skills
-    parts.extend(profile.get("skills", []))
-
-    edu = profile.get("education", {})
-    if edu.get("field"):
-        parts.append(edu["field"])
-    if edu.get("degree"):
-        parts.append(edu["degree"])
-
-    exp = profile.get("experience", {})
-    if exp.get("seniority"):
-        parts.append(exp["seniority"])
-    if exp.get("previous_roles"):
-        parts.extend(exp["previous_roles"])
-
-    ws = profile.get("work_style", {})
-    if ws.get("preferred_environment"):
-        parts.append(ws["preferred_environment"])
-
-    # Include soft signals (interests + hobbies) with lower weight (1×)
-    ps = profile.get("profile_signals", {})
-    parts.extend(ps.get("interests", []))
-    parts.extend(ps.get("hobbies", []))
-
-    return " ".join(filter(None, parts))
-
-
 # ---------------------------------------------------------------------------
-# Soft / semantic signal interpretation
+# Career direction change helper
 # ---------------------------------------------------------------------------
 
-# Each entry: patterns (any match triggers), signals (profile_signals dict),
-# career_directions (possible job directions), reply_hint (key for agent_logic),
-# reply_he (Hebrew summary for agent reply).
-SOFT_SIGNAL_MAP = [
-    {
-        "patterns": [r"לצייר|ציור|אוהב[תי]? לצייר|drawing\b|artwork|אמנות|מצייר[תי]?"],
-        "signals": {"hobbies": ["ציור"], "interests": ["יצירתיות", "עבודה ויזואלית"],
-                    "personality_traits": ["יצירתי/ת"]},
-        "career_directions": ["עיצוב", "UX/UI", "שיווק יצירתי", "מוצר"],
-        "reply_hint": "creative_visual",
-        "reply_he": "עדכנתי עניין יצירתי: ציור.",
-    },
-    {
-        "patterns": [r"צילום|לצלם|photography|photographer|מצלמ[תי]?"],
-        "signals": {"hobbies": ["צילום"], "interests": ["יצירתיות", "עבודה ויזואלית"],
-                    "personality_traits": ["יצירתי/ת"]},
-        "career_directions": ["שיווק יצירתי", "מוצר", "UX/UI"],
-        "reply_hint": "creative_visual",
-        "reply_he": "עדכנתי עניין ויזואלי: צילום.",
-    },
-    {
-        "patterns": [r"לכתוב|כתיבה|writing|כותב[תי]?\b|בלוג"],
-        "signals": {"hobbies": ["כתיבה"], "interests": ["תוכן", "ביטוי"],
-                    "personality_traits": ["יצירתי/ת", "תקשורתי/ת"]},
-        "career_directions": ["שיווק", "תוכן", "מוצר"],
-        "reply_hint": "creative_writing",
-        "reply_he": "עדכנתי: כתיבה.",
-    },
-    {
-        "patterns": [r"מוזיקה|מנגן[תי]?|נגינה|לשיר|שירה|music\b|musician"],
-        "signals": {"hobbies": ["מוזיקה"], "interests": ["יצירתיות"],
-                    "personality_traits": ["יצירתי/ת"]},
-        "career_directions": ["שיווק יצירתי", "מוצר"],
-        "reply_hint": "creative_music",
-        "reply_he": "עדכנתי: מוזיקה / נגינה.",
-    },
-    {
-        "patterns": [r"מספרים|חשבון\b|לחשב|אוהב[תי]?\s+מספרים|numbers\b|math\b|calcul"],
-        "signals": {"interests": ["עבודה עם מספרים", "ניתוח"],
-                    "personality_traits": ["אנליטי/ת"]},
-        "career_directions": ["דאטה", "כספים", "BI", "ניתוח מערכות"],
-        "reply_hint": "analytical",
-        "reply_he": "עדכנתי: עניין בעבודה עם מספרים.",
-    },
-    {
-        "patterns": [r"לעזור לאנשים|לעזור לאחרים|helping people|עבודה עם אנשים|אוהב[תי]?\s+אנשים|עוזר[תי]? לאנשים"],
-        "signals": {"interests": ["עבודה עם אנשים", "עזרה לאחרים"],
-                    "personality_traits": ["שירותי/ת", "סבלני/ת"]},
-        "career_directions": ["משאבי אנוש", "חינוך", "הדרכה"],
-        "reply_hint": "people_helper",
-        "reply_he": "עדכנתי: עניין בעבודה עם אנשים.",
-    },
-    {
-        "patterns": [r"להסביר|ללמד\b|הוראה|teaching\b|explaining|מלמד[תי]?|מסביר[תי]?|מדריכ[תי]?"],
-        "signals": {"interests": ["הדרכה", "הוראה"],
-                    "personality_traits": ["תקשורתי/ת", "סבלני/ת"]},
-        "career_directions": ["חינוך", "הדרכה"],
-        "reply_hint": "teaching",
-        "reply_he": "עדכנתי: עניין בהוראה והסברה.",
-    },
-    {
-        "patterns": [r"\bסדר\b|ארגון\b|organized|לארגן|תהליכים\b|processes\b|structured"],
-        "signals": {"interests": ["ארגון", "תהליכים"],
-                    "personality_traits": ["מסודר/ת"]},
-        "career_directions": ["תפעול", "ניהול פרויקטים", "ניתוח מערכות"],
-        "reply_hint": "organized",
-        "reply_he": "עדכנתי: נטייה לסדר וארגון.",
-    },
-    {
-        "patterns": [r"טכנולוגיה|מחשבים\b|technology\b|tech\b|גאדג'טים|gadgets"],
-        "signals": {"interests": ["טכנולוגיה", "חדשנות"],
-                    "personality_traits": ["אנליטי/ת"]},
-        "career_directions": ["פיתוח תוכנה", "דאטה", "ניתוח מערכות", "מוצר"],
-        "reply_hint": "tech",
-        "reply_he": "עדכנתי: עניין בטכנולוגיה.",
-    },
-    {
-        "patterns": [r"ספורט\b|sport\b|להתאמן|כושר\b|fitness\b|אתלטי"],
-        "signals": {"hobbies": ["ספורט"],
-                    "personality_traits": ["אנרגטי/ת", "ממושמע/ת"]},
-        "career_directions": [],
-        "reply_hint": "hobby_sport",
-        "reply_he": "עדכנתי: ספורט כתחביב.",
-    },
-    {
-        "patterns": [r"בישול|לבשל|cooking\b|cook\b|אוכל"],
-        "signals": {"hobbies": ["בישול"],
-                    "personality_traits": ["יצירתי/ת", "מסודר/ת"]},
-        "career_directions": [],
-        "reply_hint": "hobby_cooking",
-        "reply_he": "עדכנתי: בישול כתחביב.",
-    },
-    {
-        "patterns": [r"עבודה עצמאית|לעבוד לבד|independent work|solo\b|עצמאי[ת]?"],
-        "signals": {"work_preferences": ["עבודה עצמאית"],
-                    "personality_traits": ["עצמאי/ת"]},
-        "career_directions": [],
-        "reply_hint": "independent",
-        "reply_he": "עדכנתי: העדפה לעבודה עצמאית.",
-    },
-    {
-        "patterns": [r"עבודת צוות|לעבוד עם אנשים|team\b|בצוות|collaborate"],
-        "signals": {"work_preferences": ["עבודה בצוות"],
-                    "personality_traits": ["חברתי/ת", "שיתופי/ת"]},
-        "career_directions": [],
-        "reply_hint": "team",
-        "reply_he": "עדכנתי: העדפה לעבודה בצוות.",
-    },
-    {
-        "patterns": [r"יציבות|stable job|ביטחון תעסוקתי|secure job"],
-        "signals": {"career_values": ["יציבות", "ביטחון תעסוקתי"]},
-        "career_directions": [],
-        "reply_hint": "stability",
-        "reply_he": "עדכנתי: ערך — יציבות.",
-    },
-    {
-        "patterns": [r"התפתחות|growth\b|ללמוד|להתפתח|קידום|learning\b"],
-        "signals": {"career_values": ["התפתחות", "למידה"]},
-        "career_directions": [],
-        "reply_hint": "growth",
-        "reply_he": "עדכנתי: ערך — התפתחות.",
-    },
-    {
-        "patterns": [r"איזון|work.life|שעות גמישות|flexible hours"],
-        "signals": {"career_values": ["איזון בית-עבודה", "גמישות"]},
-        "career_directions": [],
-        "reply_hint": "balance",
-        "reply_he": "עדכנתי: ערך — איזון בית-עבודה.",
-    },
-    {
-        "patterns": [r"לא יודע[תי]? מה|אין לי כיוון|מתלבט[תי]?|לא בטוח[ה]? |לא ברור לי|don.?t know what|uncertain\b|confused\b"],
-        "signals": {"free_notes": ["זקוק/ה להכוונה קריירה"]},
-        "career_directions": [],
-        "reply_hint": "uncertainty",
-        "reply_he": "מה יותר מושך אותך — אנשים, נתונים, יצירה או ניהול?",
-    },
-]
-
-# Signals that indicate avoidance (add to constraints, not interests)
-SOFT_AVOID_PATTERNS = [
-    (r"לא אוהב[תי]?\s+(?:לדבר עם לקוח|שירות לקוח|ממשק לקוח)",
-     ["שירות לקוחות", "מכירות"]),
-    (r"לא אוהב[תי]?\s+(?:לחץ|pressure\b|stressed)",
-     ["עבודה בלחץ"]),
-    (r"לא אוהב[תי]?\s+(?:משמרות|shifts\b|night shift)",
-     ["משמרות"]),
-    (r"don't like (?:customers|clients|pressure|shifts)",
-     ["שירות לקוחות", "עבודה בלחץ"]),
-]
-
-
-def interpret_free_text_signal(message: str, current_profile: dict) -> dict:
-    """
-    Interprets free-text, casual, or indirect user messages.
-    Returns dict with profile_signals, possible_career_directions, reply_hint, reply_he.
-    Returns {} if no soft signals found.
-    """
-    tl = message.lower()
-    result = {
-        "profile_signals": {},
-        "possible_career_directions": [],
-        "reply_hint": None,
-        "reply_he": None,
-        "add_constraints_avoid": [],
-    }
-    matched_any = False
-
-    for entry in SOFT_SIGNAL_MAP:
-        if any(re.search(pat, tl, re.IGNORECASE) for pat in entry["patterns"]):
-            for sig_type, values in entry.get("signals", {}).items():
-                bucket = result["profile_signals"].setdefault(sig_type, [])
-                for v in values:
-                    if v not in bucket:
-                        bucket.append(v)
-            for d in entry.get("career_directions", []):
-                if d not in result["possible_career_directions"]:
-                    result["possible_career_directions"].append(d)
-            if not result["reply_hint"]:
-                result["reply_hint"] = entry.get("reply_hint")
-            if not result["reply_he"]:
-                result["reply_he"] = entry.get("reply_he")
-            matched_any = True
-
-    # Avoidance signals
-    for pat, avoids in SOFT_AVOID_PATTERNS:
-        if re.search(pat, tl, re.IGNORECASE):
-            for a in avoids:
-                if a not in result["add_constraints_avoid"]:
-                    result["add_constraints_avoid"].append(a)
-            matched_any = True
-
-    return result if matched_any else {}
+def detect_career_direction_change(message: str, profile: dict) -> bool:
+    """Return True if the message signals a shift to a different career direction."""
+    old_interests = set(profile.get("career_interests", []))
+    if not old_interests:
+        return False
+    updates = extract_profile_updates(message, profile)
+    new_interests = set(updates.get("career_interests", []))
+    if not new_interests:
+        return False
+    return bool(new_interests - old_interests) and not (new_interests & old_interests)

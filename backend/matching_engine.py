@@ -13,7 +13,12 @@ from typing import List, Dict, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(_HERE, "careerfit.db")
+
+# Use the resolved DB path from database.py (handles /tmp copy workaround for OneDrive mounts)
+try:
+    from database import DB_PATH
+except ImportError:
+    DB_PATH = os.path.join(_HERE, "careerfit.db")
 
 # TF-IDF objects — built lazily on first search
 _tfidf_vectorizer = None
@@ -182,15 +187,17 @@ CATEGORY_TITLE_KEYWORDS = {
 # TF-IDF index
 # ---------------------------------------------------------------------------
 
-def _build_tfidf_index(limit: int = 100_000):
+def _build_tfidf_index(limit: int = 15_000):
     global _tfidf_vectorizer, _tfidf_matrix, _tfidf_job_ids
     if not os.path.exists(DB_PATH):
         return
     try:
         from sklearn.feature_extraction.text import TfidfVectorizer
         conn = sqlite3.connect(DB_PATH)
+        # Random sample across quality tiers for representative vocabulary
         rows = conn.execute(
-            "SELECT job_id, combined_text_for_matching FROM jobs_clean WHERE job_quality_score > 20 LIMIT ?",
+            "SELECT job_id, combined_text_for_matching FROM jobs_clean "
+            "ORDER BY RANDOM() LIMIT ?",
             (limit,)
         ).fetchall()
         conn.close()
@@ -215,9 +222,9 @@ def _build_tfidf_index(limit: int = 100_000):
 
 
 def get_tfidf_scores(profile_text: str, candidate_ids: List[str]) -> Dict[str, float]:
+    """Return TF-IDF cosine similarity scores. Returns {} if index not ready (non-blocking)."""
     global _tfidf_vectorizer, _tfidf_matrix, _tfidf_job_ids
-    if _tfidf_vectorizer is None:
-        _build_tfidf_index()
+    # Never build synchronously inside a request — background thread handles it
     if _tfidf_vectorizer is None or not profile_text.strip():
         return {}
     try:
@@ -574,551 +581,301 @@ def score_job(profile: dict, job: dict, tfidf_sim: float = 0.0,
               remote_only_requested: bool = False,
               country_preference: str = "") -> dict:
     """
-    Score a single job against profile.
-    Weights: role_intent 35%, tfidf 25%, skills 15%, experience 10%, location 10%, salary 5%.
-    + Israel location priority bonus: +20 local, +30 exact area, -15 remote (if not wanted), -40 foreign.
+    Score a single job against the user profile.
+    Weights: role/intent 35%, TF-IDF 25%, skills 15%, experience 10%,
+             location 10%, salary 5%.
+    Returns a dict with 'score', 'match_reasons', 'skill_gaps', 'warnings',
+    'job_country', and all raw job fields.
     """
-    user_skills = [s.lower() for s in profile.get("skills", [])]
-    user_interests = profile.get("career_interests", [])
-    profile_signals = profile.get("profile_signals", {})
-    exp = profile.get("experience", {})
-    user_seniority = exp.get("seniority", "")
-    loc = profile.get("location_preference", {})
-    user_primary = loc.get("primary", "")
-    user_fallbacks = loc.get("fallbacks", [])
-    remote_allowed = loc.get("remote_allowed", True)
-    ws = profile.get("work_style", {})
-    user_env = ws.get("preferred_environment", "")
-    wp = profile.get("work_preferences", {})
-    work_mode = wp.get("work_mode", "")
-    sal = profile.get("salary_expectation", {})
-    user_min_sal = sal.get("min")
-    user_pref_sal = sal.get("preferred")
-    user_flexible = sal.get("flexible", True)
-    avoid = profile.get("constraints", {}).get("avoid", [])
+    # ---------- Extract profile fields ----------
+    interests  = profile.get("career_interests", [])
+    skills     = profile.get("skills", [])
+    exp        = profile.get("experience", {})
+    seniority  = exp.get("seniority", "")
+    loc_pref   = profile.get("location_preference", {})
+    user_area  = loc_pref.get("primary", "")
+    fallbacks  = loc_pref.get("fallbacks", [])
+    remote_ok  = loc_pref.get("remote_allowed", False) or remote_only_requested
+    sal        = profile.get("salary_expectation", {})
+    sal_min    = sal.get("min")
+    sal_pref   = sal.get("preferred")
+    sal_flex   = sal.get("flexible", True)
+    work_style = profile.get("work_style", {})
+    work_env   = work_style.get("preferred_environment", "")
+    signals    = profile.get("profile_signals", {})
+    avoids     = profile.get("constraints", {}).get("avoid", [])
 
-    job_text = str(job.get("combined_text_for_matching", "") or "")
-    job_title = str(job.get("title_clean", "") or "")
-    job_category = str(job.get("job_category", "") or "")
-    job_description = str(job.get("description_clean", "") or "")
+    # ---------- Job fields ----------
+    title    = str(job.get("title_clean", "") or "")
+    cat      = str(job.get("job_category", "") or "")
+    desc     = str(job.get("description_clean", "") or "")
+    skills_t = str(job.get("required_skills_text", "") or "")
+    combined = str(job.get("combined_text_for_matching", "") or "")
+    job_text = combined or (title + " " + cat + " " + desc + " " + skills_t)
+    job_area = str(job.get("location_area", "") or "")
+    is_rem   = bool(job.get("is_remote", 0))
+    job_lvl  = str(job.get("experience_level_clean", "לא צוין") or "לא צוין")
+    job_sal_min = job.get("salary_min_clean")
+    job_sal_max = job.get("salary_max_clean")
+    job_work_type = str(job.get("work_type_clean", "") or "")
 
-    # Component scores
-    role_score, role_reasons = _score_role_intent(user_interests, job_title, job_category, job_description)
-    skill_score, matched_skills = _score_skills(user_skills, job_text)
-    exp_score = _score_experience(user_seniority, str(job.get("experience_level_clean", "")))
-    loc_score, _ = _score_location(
-        user_primary, user_fallbacks, remote_allowed,
-        str(job.get("location_area", "")), bool(job.get("is_remote", 0))
-    )
-    sal_score = _score_salary(
-        user_min_sal, user_pref_sal, user_flexible,
-        job.get("salary_min_clean"), job.get("salary_max_clean")
-    )
-    soft_boost, soft_reasons = _score_soft_signals(profile_signals, job_text, job_category)
-    seniority_bonus = _score_seniority_title(user_seniority, job_title)
+    # ---------- Component scores ----------
+    role_score, role_reasons = _score_role_intent(interests, title, cat, desc)
+    skill_score, matched_skills = _score_skills(skills, job_text)
+    exp_score = _score_experience(seniority, job_lvl)
+    loc_score, _ = _score_location(user_area, fallbacks, remote_ok, job_area, is_rem)
+    sal_score = _score_salary(sal_min, sal_pref, sal_flex, job_sal_min, job_sal_max)
+    env_score = _score_work_env(work_env, is_rem, job_work_type)
+    soft_score, soft_reasons = _score_soft_signals(signals, job_text, cat)
+    sen_boost = _score_seniority_title(seniority, title)
 
-    # ── Country-aware location priority layer ────────────────────────────────
-    # Boost jobs matching the user's preferred country; penalise others.
-    # country_preference: "Israel" | "United States" | "Global" | ""
-    #
-    # job_country new values (see classify_job_country):
-    #   "Israel"                 — raw location_clean confirms Israel
-    #   "Israel_possible_remote" — remote job from known Israeli company
-    #   "global_or_foreign"      — remote, definitively non-Israeli company
-    #   "unknown_remote"         — remote, company presence unknown
-    #   "United States"          — non-remote US job
-    #   "Other"                  — non-remote non-US
-    job_loc_type  = classify_job_location(job)    # "israel"|"remote"|"foreign"
-    job_country   = classify_job_country(job)     # see above
-    job_location_area = str(job.get("location_area", "") or "")
-
-    # Compute company Israel presence for debug fields (reuse in priority too)
-    _company_name = str(job.get("company_clean", "") or "")
-    _co_il_presence = company_has_israel_presence(_company_name)
-
-    # Build classification reason string for debug
-    _loc_raw = str(job.get("location_clean", "") or "")
-    if job_country == "Israel":
-        _loc_reason = "raw_location_contains_israeli_keyword"
-    elif job_country == "Israel_possible_remote":
-        if "israel" in _loc_raw.lower():
-            _loc_reason = "remote_with_israel_in_location_clean"
-        else:
-            _loc_reason = f"remote_from_known_israeli_company: {_company_name}"
-    elif job_country == "global_or_foreign":
-        _loc_reason = "remote_known_non_israeli_company"
-    elif job_country == "unknown_remote":
-        _loc_reason = "remote_company_israel_presence_unknown"
-    elif job_country == "United States":
-        _loc_reason = "us_keyword_in_location_clean"
-    else:
-        _loc_reason = f"foreign_unclassified: location_area={job.get('location_area', '')!r}"
-
-    if country_preference == "Israel":
-        # Exact Israeli city/area match is best (+30)
-        area_exact = (
-            job_country == "Israel"
-            and bool(user_primary)
-            and (
-                user_primary == job_location_area
-                or user_primary.lower() in job_location_area.lower()
-                or job_location_area.lower() in user_primary.lower()
-            )
-        )
-        if area_exact:
-            location_priority = 30    # confirmed Israeli, exact area
-        elif job_country == "Israel":
-            location_priority = 20    # confirmed Israeli job
-        elif job_country == "Israel_possible_remote":
-            location_priority = 5     # remote from Israeli company — may be workable
-        elif job_country == "unknown_remote":
-            location_priority = -10   # remote but no Israel signal
-        elif job_country == "global_or_foreign":
-            location_priority = -20   # remote, known non-Israeli
-        else:
-            location_priority = -40   # US/Other non-remote: excluded from Israel search
-
-    elif country_preference == "United States":
-        if job_country == "United States":
-            location_priority = 25    # US job bonus
-        elif job_country in ("unknown_remote", "global_or_foreign"):
-            location_priority = 5     # remote acceptable for US seekers
-        elif job_country == "Israel":
-            location_priority = -40   # Israeli jobs not relevant for US search
-        elif job_country == "Israel_possible_remote":
-            location_priority = -20   # Israeli-company remote, not ideal for US search
-        else:
-            location_priority = -20   # other foreign
-
-    elif country_preference == "Global":
-        # Pure content/skill match — no location bias
-        location_priority = 0
-
-    else:
-        # country_preference not yet set → mild Israel preference (existing behaviour)
-        area_exact = (
-            job_loc_type == "israel"
-            and bool(user_primary)
-            and (
-                user_primary == job_location_area
-                or user_primary.lower() in job_location_area.lower()
-                or job_location_area.lower() in user_primary.lower()
-            )
-        )
-        if area_exact:
-            location_priority = 30
-        elif job_country == "Israel":
-            location_priority = 20
-        elif job_country == "Israel_possible_remote":
-            location_priority = 5
-        elif job_loc_type == "remote" and not remote_only_requested:
-            location_priority = -15
-        elif job_loc_type == "foreign":
-            location_priority = -40
-        else:
-            location_priority = 0
-
-    # Weighted final score (out of 100)
-    # soft_boost adds up to ~5 extra points; seniority_bonus can add or subtract ~5 pts.
-    # location_priority adds -40 to +30 directly (not weighted — intentional strong signal).
-    final_score = (
-        role_score      * 35 +
-        tfidf_sim       * 25 +
-        skill_score     * 15 +
-        exp_score       * 10 +
-        loc_score       * 10 +
-        sal_score       *  5 +
-        soft_boost      *  5 +
-        seniority_bonus * 20 +
-        location_priority          # Israel priority bonus / remote-foreign penalty
-    )
-
-    # Build match reasons
-    reasons = list(role_reasons)
-    reasons.extend(soft_reasons)
-    if matched_skills:
-        reasons.append(f"כישורים תואמים: {', '.join(matched_skills[:3])}")
-    if exp_score > 0.7:
-        reasons.append(f"רמת ניסיון מתאימה: {job.get('experience_level_clean', '')}")
-    if loc_score > 0.7:
-        reasons.append(f"מיקום תואם: {job.get('location_area', '')}")
-    if tfidf_sim > 0.15:
-        reasons.append("דמיון טקסטואלי גבוה לפרופיל")
-    if job.get("salary_display") == "לא צוין":
-        reasons.append("השכר לא צוין")
-    if not matched_skills and user_skills:
-        reasons.append(f"כישורים חסרים: {', '.join(s.title() for s in user_skills[:2])}")
-    if loc_score < 0.3 and user_primary:
-        reasons.append(f"מיקום פחות מתאים (משרה ב{job.get('location_area', '')})")
-    if not reasons:
-        reasons.append("תוצאה כללית לפי פרופיל")
-
-    warnings = _check_constraints(avoid, job)
-    missing_skills = _get_missing_skills(user_skills, job_text)
-    anomaly_flags = [f for f in str(job.get("anomaly_flags", "")).split("|") if f]
-
-    return {
-        "job_id": str(job.get("job_id", "")),
-        "title": job_title,
-        "company_name": str(job.get("company_clean", "")),
-        "location": str(job.get("location_clean", "")),
-        "location_area": str(job.get("location_area", "")),
-        "job_category": job_category,
-        "work_type": str(job.get("work_type_clean", "")),
-        "experience_level": str(job.get("experience_level_clean", "")),
-        "salary_display": str(job.get("salary_display", "לא צוין")),
-        "match_score": round(final_score, 1),
-        "similarity_score": round(tfidf_sim * 100, 1),
-        "match_reasons": reasons,
-        "warnings": warnings,
-        "missing_skills": missing_skills,
-        "anomaly_flags": anomaly_flags,
-        "application_url": job.get("application_url"),
-        "job_posting_url": job.get("job_posting_url"),
-        # Location classification fields (used by frontend + result assembly)
-        "job_location_type": job_loc_type,             # "israel" | "remote" | "foreign"
-        "job_country": job_country,                    # see classify_job_country() docstring
-        "is_israel_job": (job_country == "Israel"),
-        # is_remote_fallback: remote shown as last resort when no Israeli jobs found
-        "is_remote_fallback": (
-            job_country == "unknown_remote"
-            and country_preference in ("Israel", "")
-            and not remote_only_requested
-        ),
-        # ── Debug fields (visible in API response for inspection) ──
-        "raw_location": _loc_raw,
-        "company_has_israel_presence": _co_il_presence,
-        "location_classification_reason": _loc_reason,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Search entry points
-# ---------------------------------------------------------------------------
-
-def _fetch_candidates(location_area: Optional[str], limit: int = 2000,
-                       category_hint: Optional[str] = None,
-                       country_preference: str = "") -> List[dict]:
-    """Fetch candidate jobs with optional location and category filters.
-
-    For Israel searches: only remote jobs are fetched since the dataset is US-centric
-    (location_area fields like הדרום/הצפון/המרכז were wrongly mapped by the pipeline
-    to US "South/North/Center" locations — they are NOT Israeli jobs).
-    """
-    if not os.path.exists(DB_PATH):
-        return []
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
+    # Apply country-level filter/boost
+    job_country = classify_job_country(job)
+    country_mult = 1.0
+    if country_preference:
         if country_preference == "Israel":
-            # Only remote jobs — the only ones that can possibly be Israel-relevant
-            # in this US-centric dataset (0 jobs have Israeli city in location_clean)
-            rows = conn.execute(
-                """SELECT * FROM jobs_clean
-                   WHERE is_remote = 1 AND job_quality_score > 20
-                   ORDER BY job_quality_score DESC LIMIT ?""",
-                (limit,)
-            ).fetchall()
-        elif location_area and location_area not in ("", "אחר"):
-            rows = conn.execute(
-                """SELECT * FROM jobs_clean
-                   WHERE (location_area = ? OR is_remote = 1)
-                     AND job_quality_score > 20
-                   ORDER BY job_quality_score DESC LIMIT ?""",
-                (location_area, limit)
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT * FROM jobs_clean
-                   WHERE job_quality_score > 20
-                   ORDER BY job_quality_score DESC LIMIT ?""",
-                (limit,)
-            ).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
+            if job_country in ("Israel", "Israel_possible_remote"):
+                country_mult = 1.2
+            elif job_country in ("global_or_foreign", "United States", "Other"):
+                country_mult = 0.1
+        elif country_preference == "United States":
+            if job_country == "United States":
+                country_mult = 1.2
+            elif job_country in ("Israel",):
+                country_mult = 0.1
+        elif country_preference == "Global":
+            # No filter — all countries valid
+            pass
+
+    # ---------- Weighted total ----------
+    base_score = (
+        role_score  * 0.35 +
+        tfidf_sim   * 0.25 +
+        skill_score * 0.15 +
+        exp_score   * 0.10 +
+        loc_score   * 0.10 +
+        sal_score   * 0.05
+    )
+    total = min((base_score + soft_score * 0.05 + sen_boost) * country_mult, 1.0)
+
+    # ---------- Compile reasons ----------
+    reasons = role_reasons[:]
+    if matched_skills:
+        reasons.append("כישורים תואמים: " + ", ".join(matched_skills[:3]))
+    reasons.extend(soft_reasons[:2])
+
+    # ---------- Gaps & warnings ----------
+    skill_gaps = _get_missing_skills(skills, job_text)
+    warnings   = _check_constraints(avoids, job)
+
+    result = dict(job)
+    result.update({
+        "score":         round(total, 4),
+        "match_reasons": reasons,
+        "skill_gaps":    skill_gaps,
+        "warnings":      warnings,
+        "job_country":   job_country,
+        "_debug": {
+            "role":    round(role_score, 3),
+            "tfidf":   round(tfidf_sim, 3),
+            "skill":   round(skill_score, 3),
+            "exp":     round(exp_score, 3),
+            "loc":     round(loc_score, 3),
+            "sal":     round(sal_score, 3),
+            "country_mult": round(country_mult, 2),
+        },
+    })
+    return result
 
 
-def _fetch_by_category(category: str, limit: int = 1000) -> List[dict]:
-    """Fetch candidates filtered by job_category."""
-    if not os.path.exists(DB_PATH):
-        return []
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(
-            """SELECT * FROM jobs_clean
-               WHERE job_category = ?
-                 AND job_quality_score > 20
-               ORDER BY job_quality_score DESC LIMIT ?""",
-            (category, limit)
-        ).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
+# ---------------------------------------------------------------------------
+# Build profile text for TF-IDF query
+# ---------------------------------------------------------------------------
+
+def build_profile_text(profile: dict) -> str:
+    """Convert profile to a text string for TF-IDF similarity matching."""
+    parts = []
+    for ci in profile.get("career_interests", []):
+        parts.append(ci)
+    for sk in profile.get("skills", []):
+        parts.append(sk)
+    edu = profile.get("education", {})
+    if edu.get("field"):
+        parts.append(edu["field"])
+    if edu.get("degree"):
+        parts.append(edu["degree"])
+    exp = profile.get("experience", {})
+    if exp.get("seniority"):
+        parts.append(exp["seniority"])
+    return " ".join(parts)
 
 
-def _filter_by_work_prefs(candidates: list, profile: dict) -> list:
-    """Post-fetch filter: remove candidates that definitely don't match work_mode/work_type.
-    Returns unfiltered list if too few candidates would remain (< 50)."""
-    wp = profile.get("work_preferences", {})
-    work_mode = wp.get("work_mode", "")   # hybrid | remote | onsite | ""
-    work_type = wp.get("work_type", "")   # full_time | part_time | ""
-
-    if not work_mode and not work_type:
-        return candidates
-
-    def _matches(job: dict) -> bool:
-        jtype = str(job.get("work_type_clean", "")).lower()
-        jremote = int(job.get("is_remote", 0))
-
-        if work_mode == "remote" and not jremote:
-            return False
-        if work_mode == "hybrid" and not jremote:
-            # Many jobs labelled as on-site may actually be hybrid; don't filter too aggressively
-            pass  # keep — let score handle it
-        if work_mode == "onsite" and jremote:
-            return False
-        if work_type == "full_time" and "חלקי" in jtype:
-            return False
-        if work_type == "part_time" and ("מלא" in jtype or "full" in jtype):
-            return False
-        return True
-
-    filtered = [j for j in candidates if _matches(j)]
-    return filtered if len(filtered) >= 50 else candidates
-
+# ---------------------------------------------------------------------------
+# Main search function
+# ---------------------------------------------------------------------------
 
 def search_jobs(profile: dict, limit: int = 10,
                 location_override: Optional[str] = None) -> Tuple[List[dict], dict]:
     """
-    Main search function. Implements smart location expansion (Stage 6).
-    Also fetches category-specific candidates when career_interests includes known categories.
-    Logs candidate counts and filters for dataset-use verification.
+    Search and rank jobs from the database against the user profile.
+
+    Returns (jobs_list, metadata_dict).
+    jobs_list: top `limit` scored jobs sorted by score DESC.
+    metadata_dict: debug info (candidates_scanned, results_count, etc.)
     """
-    from nlp_engine import build_profile_text
+    # Resolve DB path — prefer demo_jobs.db when careerfit.db is absent
+    db_path = DB_PATH
+    if not os.path.exists(db_path):
+        demo = os.path.join(_HERE, "demo_jobs.db")
+        if os.path.exists(demo):
+            db_path = demo
+        else:
+            logger.warning("No database found at %s or demo_jobs.db", db_path)
+            return [], {"error": "no_database"}
 
-    if not os.path.exists(DB_PATH):
-        logger.warning("Dataset DB not found at %s", DB_PATH)
-        return [], {"error": "מסד הנתונים לא נמצא. יש לעבד את הנתונים תחילה.",
-                    "dataset_search_ran": False}
+    country_pref = profile.get("country_preference", "")
+    interests    = profile.get("career_interests", [])
+    open_to_all  = profile.get("open_to_all", False)
+    loc_pref     = profile.get("location_preference", {})
+    user_area    = location_override or loc_pref.get("primary", "")
+    remote_ok    = loc_pref.get("remote_allowed", False)
+    exp          = profile.get("experience", {})
+    seniority    = exp.get("seniority", "")
+    work_pref    = profile.get("work_preferences", {})
+    work_mode    = work_pref.get("work_mode", "")
 
-    loc = profile.get("location_preference", {})
-    primary_location = location_override or loc.get("primary", "")
-    sal = profile.get("salary_expectation", {})
-    sal_min = sal.get("min") or sal.get("preferred")
-    wp = profile.get("work_preferences", {})
-    work_mode = wp.get("work_mode", "")
-    work_type = wp.get("work_type", "")
+    # ---------- Build SQL WHERE clause ----------
+    conditions: list = []
+    params: list = []
 
-    # Country preference drives location filtering logic
-    country_preference = profile.get("country_preference", "")  # Israel|United States|Global|""
+    # Country filter
+    if country_pref == "Israel":
+        # Israeli jobs only (raw location_clean-based) — use approximate filter
+        # Exact classification happens per-job; SQL pre-filter catches most cases
+        il_kws = ["israel", "tel aviv", "haifa", "jerusalem", "netanya",
+                  "herzliya", "ramat gan", "petah tikva", "rishon", "rehovot",
+                  "ב׳ ישראל", "ישראל"]
+        il_conds = " OR ".join(
+            "LOWER(location_clean) LIKE ?" for _ in il_kws
+        )
+        # Also include remote from known Israeli companies (can't easily filter in SQL)
+        conditions.append(f"(is_remote = 1 OR ({il_conds}))")
+        params.extend(f"%{kw}%" for kw in il_kws)
+    elif country_pref == "United States":
+        us_kws = [", ny", ", ca", ", tx", ", wa", ", il", ", ma", ", fl",
+                  "new york", "los angeles", "chicago", "san francisco",
+                  "seattle", "austin", "boston", "united states", "usa"]
+        us_conds = " OR ".join("LOWER(location_clean) LIKE ?" for _ in us_kws)
+        conditions.append(f"({us_conds})")
+        params.extend(f"%{kw}%" for kw in us_kws)
+    elif country_pref == "Global":
+        pass  # no country filter
 
-    # Detect remote-only intent (user explicitly asked for remote work)
-    remote_only = (
-        work_mode == "remote"
-        or country_preference == "Global"   # Global search = treat like remote-allowed
-        or any(kw in str(primary_location).lower()
-               for kw in ("מרחוק", "remote", "עבודה מרחוק"))
+    # Work mode filter
+    if work_mode == "remote":
+        conditions.append("is_remote = 1")
+    elif work_mode == "onsite":
+        conditions.append("is_remote = 0")
+
+    # Career interest pre-filter (broad — exact scoring happens later)
+    if interests and not open_to_all:
+        interest_kws = []
+        for ci in interests[:3]:
+            kw = ci.lower().replace("'", "''")
+            interest_kws.append(kw)
+        if interest_kws:
+            # Match against category or combined text
+            ci_conds = " OR ".join(
+                "LOWER(job_category) LIKE ? OR LOWER(combined_text_for_matching) LIKE ?"
+                for _ in interest_kws
+            )
+            conditions.append(f"({ci_conds})")
+            for kw in interest_kws:
+                params.extend([f"%{kw}%", f"%{kw}%"])
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    candidate_limit = max(limit * 40, 2000)
+    sql = (
+        f"SELECT * FROM jobs_clean {where} "
+        f"ORDER BY job_quality_score DESC "
+        f"LIMIT {candidate_limit}"
     )
 
-    logger.info("Running dataset matching...")
-    logger.info(
-        "Profile filters: location=%r, work_mode=%r, work_type=%r, salary_min=%s, open_to_all=%s",
-        primary_location, work_mode, work_type,
-        f"₪{sal_min:,.0f}" if sal_min else "—",
-        profile.get("open_to_all", False),
-    )
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(sql, params).fetchall()
+        conn.close()
+    except Exception as e:
+        logger.error("DB query error: %s | SQL: %s | params: %s", e, sql, params)
+        return [], {"error": str(e)}
 
+    if not rows:
+        # Fallback: try without interest filter
+        try:
+            fallback_sql = (
+                f"SELECT * FROM jobs_clean "
+                f"ORDER BY job_quality_score DESC LIMIT {candidate_limit}"
+            )
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(fallback_sql).fetchall()
+            conn.close()
+        except Exception as e2:
+            logger.error("Fallback DB query error: %s", e2)
+            return [], {"error": str(e2)}
+
+    if not rows:
+        return [], {"candidates_scanned": 0, "results_count": 0}
+
+    jobs_raw = [dict(r) for r in rows]
+    candidate_ids = [j.get("job_id", "") for j in jobs_raw]
+
+    # ---------- TF-IDF scores ----------
     profile_text = build_profile_text(profile)
+    tfidf_scores = {}
+    if profile_text.strip():
+        try:
+            tfidf_scores = get_tfidf_scores(profile_text, candidate_ids)
+        except Exception as e:
+            logger.warning("TF-IDF scoring skipped: %s", e)
 
-    # Determine target categories from career_interests
-    user_interests = profile.get("career_interests", [])
-    known_categories = set(CATEGORY_TITLE_KEYWORDS.keys())
-    target_categories = [i for i in user_interests if i in known_categories]
+    # ---------- Score all candidates ----------
+    remote_only = (work_mode == "remote")
+    scored = []
+    for job in jobs_raw:
+        jid = job.get("job_id", "")
+        tsim = tfidf_scores.get(jid, 0.0)
+        try:
+            result = score_job(
+                profile, job,
+                tfidf_sim=tsim,
+                remote_only_requested=remote_only,
+                country_preference=country_pref,
+            )
+            scored.append(result)
+        except Exception as e:
+            logger.debug("score_job error for %s: %s", jid, e)
 
-    # Fetch location-filtered candidates
-    fetch_limit = 3000 if profile.get("open_to_all") else 2000
-    candidates = _fetch_candidates(primary_location, limit=fetch_limit,
-                                   country_preference=country_preference)
+    # Sort by score descending
+    scored.sort(key=lambda j: j.get("score", 0), reverse=True)
+    top = scored[:limit]
 
-    # If we have category hints, augment candidates with category-specific results
-    if target_categories:
-        for cat in target_categories[:2]:
-            cat_candidates = _fetch_by_category(cat, limit=500)
-            existing_ids = {c["job_id"] for c in candidates}
-            for c in cat_candidates:
-                if c["job_id"] not in existing_ids:
-                    candidates.append(c)
-                    existing_ids.add(c["job_id"])
-
-    # Apply work_mode/work_type pre-filter
-    candidates = _filter_by_work_prefs(candidates, profile)
-
-    logger.info("Candidates scanned: %d", len(candidates))
-
-    candidate_ids = [j["job_id"] for j in candidates]
-    tfidf_scores = get_tfidf_scores(profile_text, candidate_ids) if candidate_ids else {}
-
-    scored = [score_job(profile, job, tfidf_scores.get(job["job_id"], 0.0),
-                        remote_only_requested=remote_only,
-                        country_preference=country_preference)
-              for job in candidates]
-
-    # Salary post-filter: down-weight jobs with salary below min (don't hard-exclude
-    # since many jobs have no salary data)
-    if sal_min:
-        for j in scored:
-            job_sal = j.get("salary_min") or j.get("salary_max") or 0
-            if job_sal and job_sal < sal_min * 0.75:
-                j["match_score"] = max(0, j["match_score"] - 15)
-
-    strong = [j for j in scored if j["match_score"] >= 60]
-
-    expanded = False
-    used_location = primary_location
-    expand_reason = ""
-
-    # Stage 6: Location expansion if < 5 strong matches
-    if len(strong) < 5 and primary_location:
-        fallbacks = LOCATION_FALLBACKS.get(primary_location,
-                    ["מרחוק", "תל אביב", "המרכז", "השרון", "השפלה"])
-        for fb in fallbacks:
-            fb_candidates = _filter_by_work_prefs(_fetch_candidates(fb), profile)
-            fb_ids = [j["job_id"] for j in fb_candidates]
-            fb_tfidf = get_tfidf_scores(profile_text, fb_ids) if fb_ids else {}
-            fb_scored = [score_job(profile, job, fb_tfidf.get(job["job_id"], 0.0),
-                                    country_preference=country_preference)
-                         for job in fb_candidates]
-            fb_strong = [j for j in fb_scored if j["match_score"] >= 60]
-            if len(fb_strong) >= 5:
-                scored = fb_scored
-                strong = fb_strong
-                expanded = True
-                used_location = fb
-                expand_reason = (
-                    f"הורחב ל{fb} — מעט התאמות חזקות נמצאו ב{primary_location}."
-                )
-                break
-
-    # Sort by match score descending
-    scored_sorted = sorted(scored, key=lambda j: j["match_score"], reverse=True)
-
-    # ── Country-aware result assembly ─────────────────────────────────────────
-    # Split into granular country buckets (new job_country values)
-    israel_bucket          = [j for j in scored_sorted if j.get("job_country") == "Israel"]
-    possible_remote_bucket = [j for j in scored_sorted if j.get("job_country") == "Israel_possible_remote"]
-    us_bucket              = [j for j in scored_sorted if j.get("job_country") == "United States"]
-    unknown_remote_bucket  = [j for j in scored_sorted if j.get("job_country") == "unknown_remote"]
-    global_foreign_bucket  = [j for j in scored_sorted if j.get("job_country") == "global_or_foreign"]
-    other_bucket           = [j for j in scored_sorted if j.get("job_country") == "Other"]
-
-    def _pick_from(buckets: list, n: int, chosen_ids: set) -> list:
-        """Pick up to n jobs from ordered bucket list (deduped by job_id)."""
-        picked = []
-        for job in buckets:
-            if len(picked) >= n:
-                break
-            jid = job.get("job_id")
-            if jid not in chosen_ids:
-                picked.append(job)
-                chosen_ids.add(jid)
-        return picked
-
-    chosen_ids: set = set()
-
-    if country_preference == "Global" or remote_only:
-        # No country filtering — return top results by score
-        results = scored_sorted[:limit]
-
-    elif country_preference == "United States":
-        # US jobs first, then remote (any), then other
-        MAX_REMOTE_US = 3
-        results = _pick_from(us_bucket, limit, chosen_ids)
-        if len(results) < limit:
-            all_remote = unknown_remote_bucket + global_foreign_bucket
-            results += _pick_from(all_remote, min(MAX_REMOTE_US, limit - len(results)), chosen_ids)
-        if len(results) < 3:
-            results += _pick_from(other_bucket, limit - len(results), chosen_ids)
-        results = results[:limit]
-
-    else:
-        # Israel (default) — confirmed Israel first, then Israel_possible_remote
-        # NEVER include global_or_foreign or plain US jobs in Israel search results
-        MAX_POSSIBLE_REMOTE = 2
-        results = _pick_from(israel_bucket, limit, chosen_ids)
-        results += _pick_from(possible_remote_bucket,
-                               min(MAX_POSSIBLE_REMOTE, limit - len(results)),
-                               chosen_ids)
-        # Last resort: unknown_remote if still very few results
-        if len(results) < 3:
-            results += _pick_from(unknown_remote_bucket, limit - len(results), chosen_ids)
-        results = results[:limit]
-
-    # Count how many of each type ended up in final results
-    loc_mix_debug = {
-        "israel_candidates":          len(israel_bucket),
-        "possible_remote_candidates": len(possible_remote_bucket),
-        "us_candidates":              len(us_bucket),
-        "unknown_remote_candidates":  len(unknown_remote_bucket),
-        "global_foreign_candidates":  len(global_foreign_bucket),
-        "other_candidates":           len(other_bucket),
-        "israel_returned":          sum(1 for j in results if j.get("job_country") == "Israel"),
-        "possible_remote_returned": sum(1 for j in results if j.get("job_country") == "Israel_possible_remote"),
-        "us_returned":              sum(1 for j in results if j.get("job_country") == "United States"),
-        "unknown_remote_returned":  sum(1 for j in results if j.get("job_country") == "unknown_remote"),
-        "global_foreign_returned":  sum(1 for j in results if j.get("job_country") == "global_or_foreign"),
-        "other_returned":           sum(1 for j in results if j.get("job_country") == "Other"),
-        "country_preference": country_preference or "unset",
-        "remote_only_mode": remote_only,
-    }
-
-    logger.info(
-        "Country mix [%s] — IL: %d  IL_remote: %d  US: %d  ukn_remote: %d  Other: %d",
-        country_preference or "unset",
-        loc_mix_debug["israel_returned"],
-        loc_mix_debug["possible_remote_returned"],
-        loc_mix_debug["us_returned"],
-        loc_mix_debug["unknown_remote_returned"],
-        loc_mix_debug["other_returned"],
-    )
-    logger.info("Results returned: %d (top score: %s)",
-                len(results), f"{results[0]['match_score']:.1f}" if results else "—")
-    if results:
-        from collections import Counter
-        cats = Counter(j.get("category") or j.get("job_category", "") for j in results)
-        top_cats = [c for c, _ in cats.most_common(4) if c]
-        logger.info("Top categories: %s", ", ".join(top_cats) if top_cats else "—")
-
-    metadata = {
-        "primary_location": primary_location,
-        "used_location": used_location,
-        "expanded": expanded,
-        "reason": expand_reason,
-        "total_searched": len(candidates),
-        "total_returned": len(results),
-        # Debug fields visible in API response
+    # Build metadata
+    meta = {
+        "candidates_scanned": len(jobs_raw),
+        "results_count":      len(top),
         "dataset_search_ran": True,
-        "candidates_scanned": len(candidates),
-        "results_count": len(results),
-        "location_mix_debug": loc_mix_debug,   # legacy key (kept for compat)
-        "location_scope_debug": {
-            "country_preference": country_preference or None,
-            "country_filter_applied": bool(country_preference),
-            "results_country_mix": {
-                "Israel":                loc_mix_debug["israel_returned"],
-                "Israel_possible_remote": loc_mix_debug["possible_remote_returned"],
-                "United States":         loc_mix_debug["us_returned"],
-                "unknown_remote":        loc_mix_debug["unknown_remote_returned"],
-                "global_or_foreign":     loc_mix_debug["global_foreign_returned"],
-                "Other":                 loc_mix_debug["other_returned"],
-            },
-        },
+        "country_filter":     country_pref or "none",
+        "location_filter":    user_area or "none",
+        "work_mode_filter":   work_mode or "none",
+        "top_score":          top[0].get("score", 0) if top else 0,
     }
-
-    return results, metadata
+    return top, meta
 
 
 def ensure_tfidf_ready():
+    """Pre-build the TF-IDF index if not already built. Called at startup."""
+    global _tfidf_vectorizer
     if _tfidf_vectorizer is None:
         _build_tfidf_index()
