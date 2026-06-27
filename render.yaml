@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: careerfit-backend
+    env: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: FRONTEND_URL
+        value: https://careerfit-frontend.onrender.com
+      - key: ENVIRONMENT
+        value: production
+
+  - type: static
+    name: careerfit-frontend
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE_URL
+        value: https://careerfit-backend.onrender.com
